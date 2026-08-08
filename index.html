@@ -2407,9 +2407,58 @@ async function migrateLedgersToGroupIds() {
 }
 
 /** Convenience lookup used by modules that need e.g. "the Sales ledger". */
+/** Returns the ledger tagged with a given system role (e.g. 'bank', 'cash') — deterministically
+ *  the OLDEST matching ledger, not just whichever IndexedDB happens to return first, so behavior
+ *  can't silently flip if a duplicate system-tagged ledger ever gets created by mistake. */
 async function systemLedger(systemKey) {
   const ledgers = await localDB.getAll('ledgers');
-  return ledgers.find((l) => l.system === systemKey) || null;
+  const matches = ledgers.filter((l) => l.system === systemKey);
+  if (!matches.length) return null;
+  matches.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+  return matches[0];
+}
+
+/** If more than one ledger ever ends up tagged with the same system role (this happens if
+ *  default-ledger seeding runs twice, or someone manually re-creates a "Bank Account"-style
+ *  ledger) — systemLedger() would silently pick whichever one storage returns first, which can
+ *  differ from what a transaction was actually posted against. This keeps the oldest tagged
+ *  ledger (most likely to already have real history) and untags the rest, renaming them so the
+ *  duplication is visible in Chart of Accounts rather than hidden — their balances and history
+ *  are left completely untouched, only the system tag is cleared. */
+async function migrateDeduplicateSystemLedgers() {
+  const ledgers = await localDB.getAll('ledgers');
+  const bySystem = {};
+  ledgers.forEach((l) => { if (l.system) (bySystem[l.system] = bySystem[l.system] || []).push(l); });
+  for (const [key, group] of Object.entries(bySystem)) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+    for (const dupe of group.slice(1)) {
+      await localDB.put('ledgers', { ...dupe, system: null, name: dupe.name.includes('(duplicate') ? dupe.name : `${dupe.name} (duplicate system:${key})` }, { noSync: true });
+    }
+  }
+}
+
+/** Sums every ledger under a named group ("Cash-in-Hand", "Bank Accounts", etc.) — including
+ *  any nested sub-groups — used instead of a single systemLedger() lookup wherever a summary
+ *  figure needs to be genuinely complete even when a business has more than one bank ledger
+ *  (normal — multiple real accounts) or, as happened once, an accidental duplicate. A
+ *  single-ledger lookup would silently miss both. Same group-matching logic as
+ *  groupNamesBalanceAsOf, but also returns the per-ledger breakdown for display. */
+async function sumLedgersByGroupName(groupName) {
+  const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const rootIds = groups.filter((g) => g.name === groupName).map((g) => g.id);
+  const includedIds = new Set(rootIds.flatMap((id) => groupAndDescendantIds(id, groups)));
+  const matching = ledgers.filter((l) => includedIds.has(l.groupId));
+  let total = 0;
+  const breakdown = [];
+  for (const l of matching) {
+    const bal = await ledgerBalance(l.id);
+    const nature = GROUP_NATURE[l.group] || 'debit';
+    const net = nature === 'debit' ? bal.net : -bal.net;
+    total = round2(total + net);
+    if (Math.abs(net) > 0.005) breakdown.push({ name: l.name, balance: net });
+  }
+  return { total: round2(total), breakdown };
 }
 
 
@@ -9183,15 +9232,14 @@ async function renderDashboard(container) {
     return;
   }
 
-  const [cashL, bankL, pettyL] = await Promise.all([
-    systemLedger('cash'), systemLedger('bank'), systemLedger('pettyCash')
+  // Group-based, not a single systemLedger() lookup — this is what actually fixes "a real
+  // receipt/payment isn't showing up in the fund total": if there's more than one Cash or Bank
+  // ledger (multiple real accounts, or an accidental duplicate), every one of them is included,
+  // instead of only whichever single ledger happened to be tagged as "the" system one.
+  const [cashGroup, bankGroup] = await Promise.all([
+    sumLedgersByGroupName('Cash-in-Hand'), sumLedgersByGroupName('Bank Accounts')
   ]);
-  const [cashBal, bankBal, pettyBal] = await Promise.all([
-    cashL ? ledgerBalance(cashL.id) : { net: 0 },
-    bankL ? ledgerBalance(bankL.id) : { net: 0 },
-    pettyL ? ledgerBalance(pettyL.id) : { net: 0 }
-  ]);
-  const totalFund = (cashBal.net || 0) + (bankBal.net || 0) + (pettyBal.net || 0);
+  const totalFund = round2(cashGroup.total + bankGroup.total);
 
   const inPeriod = invoices.filter((i) => i.date >= from && i.date <= to && i.status !== 'Draft');
   const salesThisMonth = await computeSalesLedgerTotal(from, to);
@@ -9257,15 +9305,10 @@ async function renderDashboard(container) {
         </div>
         <div class="kpi-value" style="font-size:26px">${fmtMoney(totalFund)}</div>
         <div class="fund-combo-breakdown" style="margin-top:10px">
-          <div class="fund-chip clickable-row" data-route-link="${cashL ? `report-gl/${cashL.id}` : 'report-trial-balance'}">
-            <div class="fc-label">💵 Cash</div><div class="fc-value">${fmtMoney(cashBal.net)}</div>
-          </div>
-          <div class="fund-chip clickable-row" data-route-link="${bankL ? `report-gl/${bankL.id}` : 'report-trial-balance'}">
-            <div class="fc-label">🏦 Bank</div><div class="fc-value">${fmtMoney(bankBal.net)}</div>
-          </div>
-          <div class="fund-chip clickable-row" data-route-link="${pettyL ? `report-gl/${pettyL.id}` : 'report-trial-balance'}">
-            <div class="fc-label">👛 Petty Cash</div><div class="fc-value">${fmtMoney(pettyBal.net)}</div>
-          </div>
+          ${[...cashGroup.breakdown.map((b) => ({ ...b, icon: '💵' })), ...bankGroup.breakdown.map((b) => ({ ...b, icon: '🏦' }))].map((b) => `
+          <div class="fund-chip clickable-row" data-route-link="report-trial-balance">
+            <div class="fc-label">${b.icon} ${b.name}</div><div class="fc-value">${fmtMoney(b.balance)}</div>
+          </div>`).join('') || '<div class="page-subtitle">No cash or bank activity yet.</div>'}
         </div>
       </div>
       ${kpi('Sales — ' + period, salesThisMonth, 'teal', 'report-sales-register', '📈')}
@@ -12994,7 +13037,7 @@ async function renderCashFlowStatement(container, filters = {}) {
   openDate.setDate(openDate.getDate() - 1);
   const openDateStr = openDate.toISOString().slice(0, 10);
 
-  const [ledgers, allGroups, cashL, bankL] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), systemLedger('cash'), systemLedger('bank')]);
+  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const pl = await profitAndLoss({ from, to });
   const netProfit = pl.netProfit;
 
@@ -13024,13 +13067,16 @@ async function renderCashFlowStatement(container, filters = {}) {
   const financingCash = round2((capitalClose - capitalOpen) + (loansClose - loansOpen));
   const netChange = round2(operatingCash + investingCash + financingCash);
 
+  // Group-based (Cash-in-Hand + Bank Accounts), not a single systemLedger() lookup — same fix
+  // as the Dashboard, for the same reason: a single-ledger lookup misses any second real bank
+  // account, or silently picks the wrong one if a duplicate system-tagged ledger ever exists.
   const cashBankOpen = round2(
-    (cashL ? (await ledgerBalance(cashL.id, { to: openDateStr })).net : 0) +
-    (bankL ? (await ledgerBalance(bankL.id, { to: openDateStr })).net : 0)
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], openDateStr)) +
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], openDateStr))
   );
   const cashBankClose = round2(
-    (cashL ? (await ledgerBalance(cashL.id, { to })).net : 0) +
-    (bankL ? (await ledgerBalance(bankL.id, { to })).net : 0)
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], to)) +
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], to))
   );
   const ties = Math.abs((cashBankOpen + netChange) - cashBankClose) < 0.01;
 
@@ -13367,6 +13413,7 @@ async function boot() {
     await seedIfEmpty();
     await migrateQuestCompanyDefaults();
     await migratePLAppropriationLedger();
+    await migrateDeduplicateSystemLedgers();
     await seedLedgerGroupsIfEmpty();
     await migrateLedgersToGroupIds();
     await seedDefaultUsersIfEmpty();
